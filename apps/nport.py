@@ -1,5 +1,7 @@
 import pandas as pd
 
+from edgar import Company, set_identity
+
 set_identity('hristocr@gmail.com')
 
 company = Company('DXYZ')

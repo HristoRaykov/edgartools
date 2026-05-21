@@ -2,6 +2,9 @@ import pandas as pd
 
 from dataclasses import asdict
 
+from edgar import set_identity, Company
+from edgar.bdc import extract_nonaccrual
+
 set_identity('hristocr@gmail.com')
 
 company = Company('FSK')

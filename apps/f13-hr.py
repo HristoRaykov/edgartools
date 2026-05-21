@@ -3,8 +3,7 @@ from dataclasses import asdict
 import numpy as np
 import pandas as pd
 
-from findata.retrieve.edgar.models import Form13FData
-
+from edgar import Company, set_identity
 
 set_identity('hristocr@gmail.com')
 
