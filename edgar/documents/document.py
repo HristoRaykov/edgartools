@@ -97,6 +97,7 @@ class Section:
     validated: bool = False  # Cross-validated flag
     part: Optional[str] = None  # Part identifier for 10-Q: "I", "II", or None for 10-K
     item: Optional[str] = None  # Item identifier: "1", "1A", "2", etc.
+    warnings: list = field(default_factory=list)  # Extraction warnings (e.g. anomalous content size)
     _text_extractor: Optional[Any] = field(default=None, repr=False)  # Callback for lazy text extraction
     _html_source: Optional[str] = field(default=None, repr=False)  # HTML source for TOC table extraction
     _section_extractor: Optional[Any] = field(default=None, repr=False)  # Section extractor for TOC sections
@@ -114,6 +115,68 @@ class Section:
 
         # Clean up boundary artifacts (page numbers, next section headers)
         return self._clean_boundary_artifacts(text)
+
+    def markdown(self) -> str:
+        """Render this section to Markdown.
+
+        Mirrors :meth:`text` but preserves syntax for tables (pipe
+        format) and lists (bullet / numbered markers) by routing
+        through the same renderer used by :meth:`Document.to_markdown`.
+
+        For heading/pattern-based sections the cached node tree is
+        rendered directly. For TOC-based sections (whose node has no
+        children — content is fetched lazily from the original HTML)
+        the section's HTML subtree is sliced between its anchors via
+        :mod:`edgar.documents.utils.section_slicer` (which preserves
+        ``<table>``/``<tbody>`` structure and de-duplicates nested
+        tables), re-parsed, and rendered. If that slice yields nothing
+        usable, this falls back to :meth:`text` so callers never get a
+        regression versus the plain-text output.
+        """
+        if self.detection_method == 'toc' and self._text_extractor is not None:
+            rendered = self._markdown_from_toc_section()
+            if rendered:
+                return self._clean_boundary_artifacts(rendered)
+            # Slice produced nothing usable — fall back to plain text so
+            # callers get correct content rather than an empty string.
+            return self.text()
+
+        # Heading/pattern-based sections: render the cached node tree.
+        # Apply the same boundary-artifact cleanup as `text()` so page
+        # numbers and bleed-in next-item headers don't leak into the
+        # markdown output.
+        from edgar.documents.renderers.markdown import MarkdownRenderer
+        renderer = MarkdownRenderer()
+        rendered = renderer.render_node(self.node)
+        return self._clean_boundary_artifacts(rendered)
+
+    def _markdown_from_toc_section(self) -> Optional[str]:
+        """Render a TOC-based section to Markdown by slicing its HTML subtree.
+
+        Slices the section HTML between anchors (preserving table/list
+        structure via :mod:`section_slicer`), re-parses it into a node tree,
+        and renders that tree to Markdown. Returns ``None`` on any failure so
+        :meth:`markdown` can fall back to :meth:`text`.
+        """
+        if self._html_source is None or self._section_extractor is None:
+            return None
+        try:
+            from edgar.documents.config import ParserConfig
+            from edgar.documents.parser import HTMLParser
+            from edgar.documents.renderers.markdown import MarkdownRenderer
+
+            section_html = self._extract_section_html(self._section_extractor, self._html_source)
+            if not section_html:
+                return None
+
+            # Re-parse the section subtree into a node tree (section detection
+            # off — we already know this is one section) and render it.
+            parsed = HTMLParser(ParserConfig(detect_sections=False)).parse(section_html)
+            rendered = MarkdownRenderer().render_node(parsed.root)
+            return rendered or None
+        except Exception as e:  # noqa: BLE001 — markdown is best-effort; text() is the safety net
+            logger.debug(f"TOC markdown render failed for section '{self.name}': {e}")
+            return None
 
     def _clean_boundary_artifacts(self, text: str) -> str:
         """
@@ -134,10 +197,10 @@ class Section:
         # Pattern: page number followed by PART header followed by Item number
         # e.g., "\n\n  16\n\n  PART I\n\nItem 1A\n\n" (this is a page break artifact)
         text = re.sub(
-            r'\n\s*\d{1,3}\s*\n\s*PART\s+[IVX]+\s*\n\s*Item\s+\d+[A-Za-z]?(?:,\s*\d+[A-Za-z]?)?\s*\n',
+            r'\n\s*\d{1,3}\s*\n\s*(?:#{1,6}\s+|\*\*\s*)?PART\s+[IVX]+(?:\s*\*\*)?\s*\n\s*(?:#{1,6}\s+|\*\*\s*)?Item\s+\d+[A-Za-z]?(?:\\?\.)?(?:,\s*\d+[A-Za-z]?(?:\\?\.)?)?(?:\s*\*\*)?\s*\n',
             '\n\n',
             text,
-            flags=re.IGNORECASE
+            flags=re.IGNORECASE,
         )
 
         # 1b. Remove interior page headers for 20-F (Table of Contents format)
@@ -152,12 +215,15 @@ class Section:
 
         # 2a. Remove trailing page footer for 10-K/10-Q (PART + Item at end)
         # Pattern: page number + PART + Item header at end (next section bleeding in)
-        # e.g., "\n\n  29\n\n  PART I\n\nItem 1B, 1C" at end
+        # e.g., "\n\n  29\n\n  PART I\n\nItem 1B, 1C" at end. Optional
+        # markdown decorations (``#``, ``**``) and backslash-escaped
+        # periods accommodate ``MarkdownRenderer`` output where each
+        # of PART or Item may have been rendered as a heading or bold.
         text = re.sub(
-            r'\n\s*\d{1,3}\s*\n\s*PART\s+[IVX]+\s*\n\s*Item\s+\d+[A-Za-z]?(?:,\s*\d+[A-Za-z]?)?\s*$',
+            r'\n\s*\d{1,3}\s*\n\s*(?:#{1,6}\s+|\*\*\s*)?PART\s+[IVX]+(?:\s*\*\*)?\s*\n\s*(?:#{1,6}\s+|\*\*\s*)?Item\s+\d+[A-Za-z]?(?:\\?\.)?(?:,\s*\d+[A-Za-z]?(?:\\?\.)?)?(?:\s*\*\*)?\s*$',
             '',
             text,
-            flags=re.IGNORECASE
+            flags=re.IGNORECASE,
         )
 
         # 2b. Remove trailing page footer for 20-F (Table of Contents at end)
@@ -169,9 +235,31 @@ class Section:
         )
 
         # 3. Remove trailing Item headers if they appear at the very end
-        # (without preceding PART header)
-        # e.g., "\n\nItem 15" or "\n\nITEM 15."
-        text = re.sub(r'\n\s*Item\s+\d+[A-Za-z]?\.?\s*$', '', text, flags=re.IGNORECASE)
+        # (without preceding PART header). Matches:
+        #   - "Item 15", "ITEM 15."  (plain text)
+        #   - "Item 15\."            (markdown-escaped period)
+        #   - "# Item 15", "## Item 15"  (markdown heading)
+        #   - "**Item 15**", "**Item 15.**"  (markdown bold)
+        # The ``MarkdownRenderer`` can produce any of these depending on
+        # how the next-item bleed-in was structured in the HTML.
+        text = re.sub(
+            r'\n\s*#{1,6}\s*Item\s+\d+[A-Za-z]?(?:\\?\.)?\s*$',
+            '',
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r'\n\s*\*\*\s*Item\s+\d+[A-Za-z]?(?:\\?\.)?\s*\*\*\s*$',
+            '',
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r'\n\s*Item\s+\d+[A-Za-z]?(?:\\?\.)?\s*$',
+            '',
+            text,
+            flags=re.IGNORECASE,
+        )
 
         # 4. Remove trailing page numbers: whitespace followed by 1-3 digits at end
         # e.g., "\n\n  100" or "\n  92"
@@ -238,60 +326,32 @@ class Section:
             return []
 
     def _extract_section_html(self, extractor, html_source: str) -> str:
-        """Extract HTML content for this section from full document HTML."""
+        """Extract HTML content for this section from full document HTML.
+
+        Delegates to the centralized anchor-to-anchor slicing primitive
+        (:mod:`edgar.documents.utils.section_slicer`), which handles the
+        top-level-only serialization that prevents nested-table duplication
+        (issue #826) and repairs orphaned table-row fragments so they survive
+        a round-trip through the parser. Reuses the extractor's cached lxml
+        tree when available.
+        """
         try:
             import lxml.html as lxml_html
-            from lxml import etree
-            import re
-
-            # Handle XML declaration
-            if html_source.startswith('<?xml'):
-                html_source = re.sub(r'<\?xml[^>]*\?>', '', html_source, count=1)
-
-            tree = lxml_html.fromstring(html_source)
+            from edgar.documents.utils.section_slicer import extract_section_html
 
             # Get section boundary info
             if self.name not in extractor.section_boundaries:
                 return ""
-
             boundary = extractor.section_boundaries[self.name]
 
-            # Find start anchor by id or legacy name attribute
-            start_elements = find_anchor_targets(tree, boundary.anchor_id)
-            if not start_elements:
-                return ""
+            # Reuse the extractor's cached tree; fall back to parsing.
+            tree = getattr(extractor, '_tree', None)
+            if tree is None:
+                if html_source.startswith('<?xml'):
+                    html_source = re.sub(r'<\?xml[^>]*\?>', '', html_source, count=1)
+                tree = lxml_html.fromstring(html_source)
 
-            # Collect all elements between start and end anchors
-            collected_elements = []
-            in_range = False
-
-            for event, el in etree.iterwalk(tree, events=('start',)):
-                if not hasattr(el, 'get'):
-                    continue
-
-                # Check if we've reached the start anchor
-                if is_anchor_match(el, boundary.anchor_id):
-                    in_range = True
-                    continue
-
-                # Check if we've reached the end boundary
-                if boundary.end_element_id and is_anchor_match(el, boundary.end_element_id):
-                    break
-
-                # Collect elements in range
-                if in_range:
-                    collected_elements.append(el)
-
-            # Convert collected elements back to HTML string
-            html_parts = []
-            for elem in collected_elements:
-                try:
-                    html_parts.append(lxml_html.tostring(elem, encoding='unicode'))
-                except (LxmlError, TypeError, AttributeError) as e:
-                    logger.debug(f"Failed to serialize element in section '{self.name}': {e}")
-                    continue
-
-            return ''.join(html_parts)
+            return extract_section_html(tree, boundary.anchor_id, boundary.end_element_id)
 
         except (LxmlError, XMLSyntaxError, ValueError) as e:
             logger.debug(f"HTML extraction failed for section '{self.name}': {e}")
@@ -595,6 +655,24 @@ class Sections(Dict[str, Section]):
         # Not found - raise KeyError
         raise KeyError(key)
 
+    def __contains__(self, key) -> bool:
+        """Membership mirrors __getitem__'s flexible resolution.
+
+        A bare ``"Item 1"`` / ``"1A"`` or a ``(part, item)`` tuple counts as
+        present whenever the corresponding section exists, even though the stored
+        key is the canonical ``"part_i_item_1"`` form. This keeps
+        ``"Item 1" in sections`` working after item keys gained canonical part
+        prefixes (edgartools-3usf).
+        """
+        if isinstance(key, str):
+            if super().__contains__(key):
+                return True
+            return self.get_item(key) is not None
+        if isinstance(key, tuple) and len(key) == 2:
+            part, item = key
+            return self.get_item(item, part) is not None
+        return super().__contains__(key)
+
 
 @dataclass
 class Document:
@@ -794,16 +872,14 @@ class Document:
             return section
 
         # If not found and looks like an item without part, check if we have multiple parts
-        # In that case, raise a helpful error
+        # In that case, raise a helpful error.
         if section_name.startswith("item_") or section_name.replace("_", "").startswith("item"):
-            # Check if we have part-aware sections (10-Q)
             matching_sections = [name for name in self.sections.keys()
                                if section_name in name and "part_" in name]
             if matching_sections:
-                # Multiple parts available - user needs to specify which one
                 parts = sorted(set(s.split("_")[1] for s in matching_sections if s.startswith("part_")))
                 raise ValueError(
-                    f"Ambiguous section '{section_name}' in 10-Q filing. "
+                    f"Ambiguous section '{section_name}'. "
                     f"Found in parts: {parts}. "
                     f"Please specify part: get_section('{section_name}', part='I') or part='II'"
                 )
@@ -838,7 +914,10 @@ class Document:
         # Lazy-load section extractor
         if not hasattr(self, '_section_extractor'):
             from edgar.documents.extractors.toc_section_extractor import SECSectionExtractor
-            self._section_extractor = SECSectionExtractor(self)
+            self._section_extractor = SECSectionExtractor(
+                self,
+                form=(self.metadata.form if self.metadata else None),
+            )
 
         return self._section_extractor.get_section_text(
             section_name, include_subsections, clean
@@ -858,7 +937,10 @@ class Document:
         """
         if not hasattr(self, '_section_extractor'):
             from edgar.documents.extractors.toc_section_extractor import SECSectionExtractor
-            self._section_extractor = SECSectionExtractor(self)
+            self._section_extractor = SECSectionExtractor(
+                self,
+                form=(self.metadata.form if self.metadata else None),
+            )
 
         return self._section_extractor.get_available_sections()
 
@@ -874,7 +956,10 @@ class Document:
         """
         if not hasattr(self, '_section_extractor'):
             from edgar.documents.extractors.toc_section_extractor import SECSectionExtractor
-            self._section_extractor = SECSectionExtractor(self)
+            self._section_extractor = SECSectionExtractor(
+                self,
+                form=(self.metadata.form if self.metadata else None),
+            )
 
         return self._section_extractor.get_section_info(section_name)
 

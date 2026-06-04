@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 from lxml import html as lxml_html
 
+from edgar.documents.form_schema import get_form_schema
 from edgar.documents.utils.anchor_targets import find_anchor_targets
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,20 @@ class TOCAnalyzer:
     rather than semantic (like API filings vs local HTML files).
     """
 
-    def __init__(self):
+    def __init__(self, form: Optional[str] = None):
+        """
+        Args:
+            form: SEC form type ('10-K', '10-Q', '20-F', etc.). Used to
+                  bound the bare-item-number TOC heuristic; without it
+                  the analyzer falls back to a conservative default
+                  that may treat small page numbers as item identifiers
+                  on forms with few items (e.g., 10-Q has only Items 1-6).
+        """
+        self.form = form
+        # Per-form schema: bare-item cap, text-keyword item rules, and the
+        # unmatched-text policy. Replaces the scattered `if self.form in (...)`
+        # branches that baked 10-K shape into form-agnostic code (edgartools-fhno).
+        self.schema = get_form_schema(form)
         # SEC section patterns for normalization
         self.section_patterns = [
             (r'(?:item|part)\s+\d+[a-z]?', 'item'),
@@ -68,25 +82,57 @@ class TOCAnalyzer:
         Returns:
             Dict mapping normalized section names to anchor IDs
         """
+        result: Dict[str, str] = {}
         if agent == 'Workiva':
             result = self._analyze_workiva_toc(html_content, tree=tree)
-            if result:
-                return result
         elif agent == 'Donnelley':
             result = self._analyze_dfin_toc(html_content, tree=tree)
-            if result:
-                return result
         elif agent == 'Novaworks':
             result = self._analyze_novaworks_toc(html_content, tree=tree)
-            if result:
-                return result
         elif agent == 'Toppan Merrill':
             result = self._analyze_toppan_toc(html_content, tree=tree)
-            if result:
-                return result
 
         # Generic fallback for unknown agents or when agent-specific parser returns empty
-        return self._analyze_generic_toc(html_content, tree=tree)
+        if not result:
+            if agent:
+                # The agent parser was tried and found nothing — make the
+                # degradation to the generic scan observable (edgartools-hk9w).
+                logger.debug("Agent parser %r returned no sections; "
+                             "falling back to generic TOC scan", agent)
+            result = self._analyze_generic_toc(html_content, tree=tree)
+
+        # Body-header fallback: some filers (Goldman Sachs, Citi — large bank
+        # 10-Ks) carry the SEC item structure only in a *link-less* TOC (page
+        # numbers, no anchors), so every link-based parser above finds few or no
+        # real items. But the document body marks each item with a bold
+        # "Item N. Title" heading preceded by an anchor. When the linked-TOC
+        # result is below the floor of items a healthy 10-K must have, scan the
+        # body headers and prefer them if they recover more canonical items.
+        if self._canonical_item_count(result) < self._expected_item_floor():
+            body = self._analyze_body_item_headers(html_content, tree=tree)
+            if self._canonical_item_count(body) > self._canonical_item_count(result):
+                return body
+        return result
+
+    @staticmethod
+    def _canonical_item_count(mapping: Optional[Dict[str, str]]) -> int:
+        """Count keys that name a canonical SEC item (optionally part-prefixed)."""
+        # A single letter suffix covers standard items (1A, 1B, 1C, 7A, 9A–9C) and
+        # legitimate company-specific ones (e.g. Caterpillar's Item 1D, Executive
+        # Officers) — not just a–c.
+        pat = re.compile(r'^(part_[ivxlcdm]+_)?item_\d+[a-z]?$', re.IGNORECASE)
+        return sum(1 for k in (mapping or {}) if pat.match(k))
+
+    def _expected_item_floor(self) -> int:
+        """Minimum canonical item count below which a 10-K TOC parse is suspect.
+
+        A real 10-K always carries well over a dozen items (1, 1A, 2, 3, 5, 7,
+        7A, 8, 9A, 10–15 …); a parse yielding only a handful means the linked
+        TOC was missed. Only 10-K is gated — the body-header signature
+        ("Item N. Title") is 10-K-shaped and the fallback is validated there.
+        Other forms return 0 (fallback never triggers).
+        """
+        return 8 if (self.form or '10-K').replace('/A', '') == '10-K' else 0
 
     def _analyze_generic_toc(self, html_content: str, tree=None) -> Dict[str, str]:
         """
@@ -115,7 +161,7 @@ class TOCAnalyzer:
             anchor_links = tree.xpath('//a[@href]')
 
             toc_sections = []
-            current_part = None  # Track current part context for 10-Q filings
+            current_part = self.schema.seed_part  # Track part context; seeds Part I for 10-Q
 
             for link in anchor_links:
                 href = link.get('href', '').strip()
@@ -171,10 +217,98 @@ class TOCAnalyzer:
             section_mapping = self._build_section_mapping(toc_sections, tree=tree)
 
         except Exception:
-            # Return empty mapping on error - fallback to other methods
-            pass
+            # Degrade to other strategies, but record why the generic scan failed
+            # so the silent-fallback path stays diagnosable (edgartools-hk9w).
+            logger.debug("Generic TOC parser failed", exc_info=True)
 
         return section_mapping
+
+    # Matches a body section heading: "Item 1A. Risk Factors", "Item 8. Financial
+    # Statements …". The required title after the number (``\S``) is what separates
+    # a real heading from a bare "Item 1A" TOC cell and from inline prose
+    # cross-references like "… in Part II, Item 7 of this Form 10-K …" (which start
+    # with "Part", not "Item N.").
+    _BODY_ITEM_HEADER = re.compile(r'^Item\s+(\d+)([A-Z]?)\.?\s+\S', re.IGNORECASE)
+    _BODY_PART_DIVIDER = re.compile(r'^Part\s+([IVX]+)\b', re.IGNORECASE)
+
+    def _analyze_body_item_headers(self, html_content: str, tree=None) -> Dict[str, str]:
+        """Map items from bold body headings instead of TOC links.
+
+        Some filers (notably Goldman Sachs and Citigroup — large bank 10-Ks)
+        carry the SEC item structure only in a *link-less* TOC (item labels and
+        page numbers, no anchors), so every anchor/link-based TOC parser finds
+        nothing usable. But the document body marks each item with a bold
+        heading like "Item 1A. Risk Factors", each immediately preceded by an
+        empty anchor ``<div id="…">``. This scans those headers in document
+        order, tracks Part context from sibling "PART II" dividers, and resolves
+        each item to its nearest preceding anchor id — returning the same
+        ``{section_key: anchor_id}`` contract as the link-based parsers, so the
+        standard boundary/slicing pipeline works unchanged (edgartools-sldz).
+        """
+        try:
+            tree = self._ensure_tree(html_content, tree)
+        except Exception:
+            logger.debug("Body-header scan: tree parse failed", exc_info=True)
+            return {}
+
+        mapping: Dict[str, str] = {}
+        current_part: Optional[str] = None
+        last_anchor_id: Optional[str] = None
+
+        for el in tree.iter():
+            tag = el.tag
+            if not isinstance(tag, str):
+                continue
+            # Track the most recent element carrying an id; for a body heading
+            # this is the empty anchor div placed immediately before it.
+            eid = el.get('id')
+            if eid:
+                last_anchor_id = eid
+
+            text = (el.text_content() or '').strip()
+            # A heading is short; an over-long text means we're looking at an
+            # ancestor container that wraps the heading plus its body — skip it
+            # and let the inner heading element match.
+            if not text or len(text) > 200:
+                continue
+            if not self._is_bold_header(el, tag):
+                continue
+
+            part_m = self._BODY_PART_DIVIDER.match(text)
+            if part_m and not re.search(r'item\s+\d', text, re.IGNORECASE):
+                current_part = f"Part {part_m.group(1).upper()}"
+                continue
+
+            item_m = self._BODY_ITEM_HEADER.match(text)
+            if not item_m:
+                continue
+            if not last_anchor_id:
+                continue
+            item_name = f"Item {item_m.group(1)}{item_m.group(2).upper()}"
+            key = self._make_section_key(item_name, current_part)
+            # First occurrence in document order wins (the body heading; a
+            # link-less TOC has no competing "Item N. Title" span).
+            if key:
+                mapping.setdefault(key, last_anchor_id)
+
+        return mapping
+
+    @staticmethod
+    def _is_bold_header(el, tag: str) -> bool:
+        """Heuristic: is this element styled as a heading?
+
+        True for semantic heading tags and for elements whose own inline style
+        is bold (``font-weight:700`` / ``bold``). Body prose is not bold, so this
+        plus the strict heading-text patterns keeps inline references out.
+        """
+        if tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+            return True
+        style = (el.get('style') or '').lower()
+        m = re.search(r'font-weight:\s*(bold|\d+)', style)
+        if not m:
+            return False
+        val = m.group(1)
+        return val == 'bold' or (val.isdigit() and int(val) >= 600)
 
     # ---- Agent-specific TOC parsers ----
 
@@ -258,6 +392,18 @@ class TOCAnalyzer:
         if part_match:
             return f"Part {part_match.group(1).upper()}"
 
+        # Keyword fallback (Business → Item 1, Risk Factors → Item 1A, …). Agent
+        # TOCs sometimes split the "Item N" label and its title into separate
+        # cells with different hrefs, so a row grouped by shared href carries only
+        # the title ("Business"). The generic parser resolves these via the
+        # per-form keyword vocabulary; without this the agent parsers silently
+        # drop the row, losing Item 1 on Workiva 10-Ks (GH #837). Explicit Item/
+        # Part matches above keep priority, so "Item 1A. Risk Factors" still
+        # resolves to Item 1A, not Item 1A-via-keyword.
+        matched = self.schema.match_text(text.lower(), use_exclusions=True)
+        if matched:
+            return matched
+
         return None
 
     def _item_from_anchor(self, anchor_id: str) -> Optional[str]:
@@ -283,7 +429,10 @@ class TOCAnalyzer:
             letter = item_match.group(2).upper()
             return f"Item {num}{letter}"
 
-        part_match = re.search(r'part[_\s]*([ivx]+)', anchor_lower)
+        # Require a left delimiter (start, separator, '#', or '-') so the 'part'
+        # token is a real word boundary — otherwise 'counterparties' matches as
+        # 'Part I' and pollutes the part context of every item parsed afterward.
+        part_match = re.search(r'(?:^|[_\s#-])part[_\s]*([ivx]+)', anchor_lower)
         if part_match:
             return f"Part {part_match.group(1).upper()}"
 
@@ -348,23 +497,73 @@ class TOCAnalyzer:
         return self._find_toc_table_by_links(tree)
 
     @staticmethod
-    def _make_section_key(item_name: str, current_part: Optional[str]) -> str:
+    def _part_rank(label: Optional[str]) -> Optional[int]:
+        """Document-order rank of a Part label from its roman numeral.
+
+        "Part I" -> 1, "Part II" -> 2, "Part IV" -> 4. Tolerates formatting
+        differences ("IV", "part iv"). Returns None when no roman numeral is
+        present.
+        """
+        m = re.search(r'[ivxlcdm]+', label or '', re.IGNORECASE)
+        if not m:
+            return None
+        values = {'i': 1, 'v': 5, 'x': 10, 'l': 50, 'c': 100, 'd': 500, 'm': 1000}
+        total = prev = 0
+        for ch in reversed(m.group().lower()):
+            v = values[ch]
+            total += -v if v < prev else v
+            prev = max(prev, v)
+        return total
+
+    def _make_section_key(self, item_name: str, current_part: Optional[str]) -> Optional[str]:
         """
         Build a section mapping key, adding part context when available.
 
-        For 10-K filings (no duplicate items across parts), part prefix is
-        cosmetic but harmless. For 10-Q filings, it's essential to distinguish
-        Item 1 in Part I from Item 1 in Part II.
+        When no part context was detected, infer the canonical part from the item
+        number for forms whose items are unique across parts (10-K: Items 1–4 are
+        Part I, 5–9 Part II, 10–14 Part III, 15–16 Part IV). This yields a
+        consistent ``part_ii_item_7`` key instead of a bare ``Item 7`` on filings
+        where the TOC lacked explicit Part headers (edgartools-3usf). 10-Q items
+        repeat across parts, so its schema supplies no ranges and the bare key is
+        kept — a 10-Q part must be detected, never inferred.
+
+        Rejects a spurious *back-reference* by returning ``None``: on a unique-item
+        form an item has exactly one valid Part, so when the detected
+        ``current_part`` comes *after* the item's canonical Part the anchor was
+        matched on a cross-reference, not the real heading — typically the Item 15
+        exhibit index in Part IV that cites "Item 1A …". Emitting a
+        ``part_iv_item_1`` key there would shadow the real Part I section in the
+        unconstrained ``sections.get_item("1")`` accessor and silently return Risk
+        Factors instead of Business (GH #836). Retrieval of a dropped section
+        falls through to the canonical-Part key or the legacy parser (same path as
+        GH #821, whose GS mislabel — Item 1 under Part II — is also a back-ref).
+
+        A detected part *before* the canonical Part is left untouched: that is a
+        coarse TOC with a single Part header preceding later-Part items (Item 7
+        listed under the lone "Part I" header), where the detected key is the
+        established behavior and dropping it would lose a real section.
 
         Args:
             item_name: Normalized item name like "Item 1A"
             current_part: Current part context like "Part I", or None
 
         Returns:
-            Key like "part_i_item_1a" or "Item 1A"
+            Key like "part_i_item_1a", a bare "Item 1A" when no part is known, or
+            ``None`` when the detected part is later than the item's only valid
+            part (a back-reference).
         """
+        canonical_part = self.schema.part_for_item(item_name)
         if current_part:
-            part_key = current_part.lower().replace(' ', '_')
+            if canonical_part:
+                cur_rank = self._part_rank(current_part)
+                can_rank = self._part_rank(canonical_part)
+                if cur_rank is not None and can_rank is not None and cur_rank > can_rank:
+                    return None
+            effective_part = current_part
+        else:
+            effective_part = canonical_part
+        if effective_part:
+            part_key = effective_part.lower().replace(' ', '_')
             item_key = item_name.lower().replace(' ', '_')
             return f"{part_key}_{item_key}"
         return item_name
@@ -400,7 +599,7 @@ class TOCAnalyzer:
                 return {}
 
             mapping = {}
-            current_part = None
+            current_part = self.schema.seed_part
             rows = toc_table.xpath('.//tr')
 
             for row in rows:
@@ -448,7 +647,7 @@ class TOCAnalyzer:
                     # Verify target exists
                     if find_anchor_targets(tree, anchor_id):
                         key = self._make_section_key(parsed, current_part)
-                        if key not in mapping:
+                        if key and key not in mapping:
                             mapping[key] = anchor_id
 
             return mapping
@@ -482,7 +681,7 @@ class TOCAnalyzer:
                 return self._analyze_dfin_links(tree)
 
             mapping = {}
-            current_part = None
+            current_part = self.schema.seed_part
             rows = toc_table.xpath('.//tr')
 
             # Walk rows in order so text-only "PART I"/"PART II" rows update
@@ -530,7 +729,7 @@ class TOCAnalyzer:
 
                     if find_anchor_targets(tree, anchor_id):
                         key = self._make_section_key(parsed, current_part)
-                        if key not in mapping:
+                        if key and key not in mapping:
                             mapping[key] = anchor_id
 
             return mapping
@@ -548,7 +747,7 @@ class TOCAnalyzer:
         identify TOC-like links by their anchor pattern alone.
         """
         mapping = {}
-        current_part = None
+        current_part = self.schema.seed_part
 
         for link in tree.xpath('//a[@href]'):
             href = link.get('href', '').strip()
@@ -567,7 +766,7 @@ class TOCAnalyzer:
 
             if find_anchor_targets(tree, anchor_id):
                 key = self._make_section_key(parsed, current_part)
-                if key not in mapping:
+                if key and key not in mapping:
                     mapping[key] = anchor_id
 
         return mapping
@@ -596,7 +795,7 @@ class TOCAnalyzer:
                 return {}
 
             mapping = {}
-            current_part = None
+            current_part = self.schema.seed_part
             links = toc_table.xpath('.//a[@href]')
 
             for link in links:
@@ -626,7 +825,7 @@ class TOCAnalyzer:
                 # Verify target exists
                 if find_anchor_targets(tree, anchor_id):
                     key = self._make_section_key(parsed, current_part)
-                    if key not in mapping:
+                    if key and key not in mapping:
                         mapping[key] = anchor_id
 
             return mapping
@@ -658,7 +857,7 @@ class TOCAnalyzer:
                 return {}
 
             mapping = {}
-            current_part = None
+            current_part = self.schema.seed_part
             rows = toc_table.xpath('.//tr')
 
             for row in rows:
@@ -713,7 +912,7 @@ class TOCAnalyzer:
 
                     if find_anchor_targets(tree, anchor_id):
                         key = self._make_section_key(parsed, current_part)
-                        if key not in mapping:
+                        if key and key not in mapping:
                             mapping[key] = anchor_id
 
             return mapping
@@ -770,12 +969,24 @@ class TOCAnalyzer:
                         if item_match:
                             return item_match.group(1)
 
-                        # Match bare item number: "1A" or "1" (only valid 10-K item numbers: 1-15)
-                        # This prevents page numbers (50, 108, etc.) from being treated as items
-                        bare_item_match = re.match(r'^([1-9]|1[0-5])([A-Z]?)\.?\s*$', prev_text, re.IGNORECASE)
-                        if bare_item_match:
+                        # Match bare item number: "1A" or "1". Page numbers
+                        # (50, 108, etc.) are filtered by capping the
+                        # accepted range to the form's known maximum.
+                        # Without `form` we fall back to 15 (legacy behaviour).
+                        # PPG 10-Q `0000079879-26-000170` triggered the bug
+                        # this guard fixes: a page-number `<td>8</td>` was
+                        # interpreted as "Item 8", producing a phantom
+                        # `part_i_item_8` on a form that has no Item 8.
+                        # Leading digit must be 1-9 (no zero-padded
+                        # forms like `08` or `01` — those are page
+                        # numbers, not item identifiers). Matches the
+                        # tight `[1-9]` prefix of the original regex
+                        # rather than allowing any `\d`.
+                        max_item_num = self.schema.max_bare_item
+                        bare_item_match = re.match(r'^([1-9]\d?)([A-Za-z]?)\.?\s*$', prev_text, re.IGNORECASE)
+                        if bare_item_match and 1 <= int(bare_item_match.group(1)) <= max_item_num:
                             item_num = bare_item_match.group(1)
-                            item_letter = bare_item_match.group(2)
+                            item_letter = bare_item_match.group(2).upper()
                             return f"Item {item_num}{item_letter}"
 
                         # Match part: "Part I" or just "I"
@@ -804,7 +1015,7 @@ class TOCAnalyzer:
                         return part_match.group(1)
 
         except Exception:
-            pass
+            logger.debug("Preceding-item-label extraction failed", exc_info=True)
 
         return ''
 
@@ -868,6 +1079,7 @@ class TOCAnalyzer:
                 prev = prev.getprevious()
 
         except Exception:
+            logger.debug("Part inference from row context failed", exc_info=True)
             return None
 
         return None
@@ -979,23 +1191,20 @@ class TOCAnalyzer:
         if part_match:
             return f"Part {part_match.group(1).upper()}"
 
-        # Handle specific known sections by text
+        # Text-keyword fallback, driven by the per-form schema. The keyword→item
+        # vocabulary (Business→Item 1, Financial Statements→Item 8, ...) is
+        # 10-K-shaped, so the schema scopes it per form: 10-K applies the full
+        # table; 10-Q keeps only the safe Risk-Factors→Item 1A overlap and skips
+        # everything else (returning "" so `_build_section_mapping` doesn't emit
+        # bogus `part_i_<text>` keys); other forms (20-F, ...) have no rules and
+        # return the raw text. This replaces the old `if self.form in (...)`
+        # branches with declarative data (edgartools-fhno).
         text_lower = text.lower()
-        if 'business' in text_lower and 'item' not in text_lower:
-            return "Item 1"
-        elif 'risk factors' in text_lower and 'item' not in text_lower:
-            return "Item 1A"
-        elif 'properties' in text_lower and 'item' not in text_lower:
-            return "Item 2"
-        elif 'legal proceedings' in text_lower and 'item' not in text_lower:
-            return "Item 3"
-        elif 'management' in text_lower and 'discussion' in text_lower:
-            return "Item 7"
-        elif 'financial statements' in text_lower:
-            return "Item 8"
-        elif 'exhibits' in text_lower:
-            return "Item 15"
-
+        matched = self.schema.match_text(text_lower, use_exclusions=True)
+        if matched:
+            return matched
+        if self.schema.skip_unmatched_text:
+            return ""
         return text  # Return as-is if no normalization applies
 
     def _get_section_type_and_order(self, text: str) -> Tuple[str, int]:
@@ -1032,21 +1241,25 @@ class TOCAnalyzer:
             part_num = self._roman_to_int(part_roman)
             return 'part', part_num * 100  # Part I=100, Part II=200, etc.
 
-        # Known sections without explicit item numbers
-        if 'business' in text_lower:
-            return 'item', 1000  # Item 1
-        elif 'risk factors' in text_lower:
-            return 'item', 1001  # Item 1A
-        elif 'properties' in text_lower:
-            return 'item', 2000  # Item 2
-        elif 'legal proceedings' in text_lower:
-            return 'item', 3000  # Item 3
-        elif 'management' in text_lower and 'discussion' in text_lower:
-            return 'item', 7000  # Item 7
-        elif 'financial statements' in text_lower:
-            return 'item', 8000  # Item 8
-        elif 'exhibits' in text_lower:
-            return 'item', 15000  # Item 15
+        # Known sections without explicit item numbers, via the per-form schema
+        # keyword rules. The order is derived from the matched item name using
+        # the same formula as the explicit-item path above (Business→Item 1→1000,
+        # Risk Factors→Item 1A→1001, Financial Statements→Item 8→8000, ...), so
+        # the keyword table no longer needs its own hand-maintained order
+        # constants. Form scoping lives in the schema: 10-Q matches only Risk
+        # Factors, other forms match nothing → ('other', 99999) (edgartools-fhno).
+        #
+        # Exclusions are intentionally NOT applied here, mirroring the historical
+        # behaviour where the sort-order lookup (unlike name normalization)
+        # ignored the "…and 'item' absent" guard. See form_schema.py.
+        matched = self.schema.match_text(text_lower, use_exclusions=False)
+        if matched:
+            m = re.match(r'item\s+(\d+)([a-z]?)', matched, re.IGNORECASE)
+            if m:
+                item_num = int(m.group(1))
+                item_letter = m.group(2) or ''
+                order = item_num * 1000 + (ord(item_letter.upper()) - ord('A') + 1 if item_letter else 0)
+                return 'item', order
 
         return 'other', 99999
 
@@ -1067,6 +1280,32 @@ class TOCAnalyzer:
 
         return result
 
+    # Named sections that legitimately carry no item number but should still be
+    # exposed. Everything else without an item number is descriptive free-text noise.
+    _KNOWN_NAMED_SECTIONS = frozenset({'signatures'})
+    # A canonical section key: item, optionally part-prefixed (part_ii_item_7).
+    # The single-letter suffix admits standard items (1A, 7A, 9A–9C) and
+    # legitimate company-specific ones (Caterpillar's Item 1D), not just a–c.
+    _CANONICAL_ITEM_KEY = re.compile(r'^(part_[ivxlcdm]+_)?item_\d+[a-z]?$', re.IGNORECASE)
+    # A still-unprefixed bare item key ("Item 7") — valid content, wrong shape;
+    # the missing-part-prefix normalization is tracked separately (edgartools-3usf).
+    _BARE_ITEM_KEY = re.compile(r'^Item\s+\d+[A-Z]?$', re.IGNORECASE)
+
+    @classmethod
+    def _is_known_named_section(cls, name: str) -> bool:
+        return (name or '').strip().lower() in cls._KNOWN_NAMED_SECTIONS
+
+    def _is_valid_section_key(self, section_name: str, normalized_name: str) -> bool:
+        """A section key is valid only if it names a canonical item (optionally
+        part-prefixed), a bare ``Item N`` (missing-prefix), or an allowlisted
+        named section. Everything else is descriptive free-text noise from the
+        raw-text fallback (edgartools-3au1)."""
+        if self._CANONICAL_ITEM_KEY.match(section_name):
+            return True
+        if self._BARE_ITEM_KEY.match(section_name):
+            return True
+        return self._is_known_named_section(normalized_name)
+
     def _build_section_mapping(self, toc_sections: List[TOCSection],
                                tree=None) -> Dict[str, str]:
         """Build final section mapping, handling duplicates intelligently.
@@ -1086,16 +1325,38 @@ class TOCAnalyzer:
         seen_names = set()
 
         for section in toc_sections:
-            # Generate part-aware section name for 10-Q filings
-            if section.part:
-                # Convert "Part I" -> "part_i", "Part II" -> "part_ii"
-                part_key = section.part.lower().replace(' ', '_')
-                # Convert "Item 1" -> "item_1", "Item 1A" -> "item_1a"
-                item_key = section.normalized_name.lower().replace(' ', '_')
-                section_name = f"{part_key}_{item_key}"
-            else:
-                # 10-K filings: use normalized name as-is
-                section_name = section.normalized_name
+            # Skip rows whose text didn't normalise to anything (the
+            # 10-Q text fallback returns "" for unrecognised section
+            # names — see `_normalize_section_name`). Without this
+            # guard, downstream would emit empty-tail keys like
+            # `part_i_` and a `SECSectionExtractor` Part-header
+            # mis-classification.
+            if not section.normalized_name:
+                continue
+            # A Part label is navigation context, never a content section. Some
+            # TOCs (and the Item 15 exhibit index, which cross-references "Part I,
+            # Item 1A …") feed bare "Part X" link text through normalization,
+            # which would otherwise emit malformed keys like `part_i_part_ii`,
+            # `part_iv_part_i`, or a bare `Part I`. Part context is already tracked
+            # via `current_part`, so dropping these loses no boundary (edgartools-sldz).
+            if re.match(r'^Part\s+[IVXLCDM]+$', section.normalized_name, re.IGNORECASE):
+                continue
+            # Build the key with part context — detected (section.part) or, when
+            # absent, inferred from the item number for 10-K (edgartools-3usf).
+            section_name = self._make_section_key(section.normalized_name, section.part)
+
+            # Emit only well-formed keys. The 10-K raw-text fallback in
+            # _normalize_section_name returns link text verbatim when no
+            # Item/Part/keyword rule matches, leaking two kinds of noise as
+            # top-level sections: pure descriptive titles (part_ii_risk_management,
+            # "19. Deferred Compensation …") and Item-15 exhibit-index prose that
+            # merely *contains* an item number (part_iv_,_item_1a,
+            # "in Part II, Item 5 of this report …"). A canonical key is an item
+            # (optionally part-prefixed), a still-unprefixed bare "Item N" (the
+            # missing-part-prefix case, edgartools-3usf), or an allowlisted named
+            # section like Signatures (edgartools-3au1).
+            if section_name is None or not self._is_valid_section_key(section_name, section.normalized_name):
+                continue
 
             if section_name in seen_names:
                 # Duplicate: validate which anchor is better.
@@ -1136,7 +1397,7 @@ class TOCAnalyzer:
                     if item_pattern in el_text:
                         return True
         except Exception:
-            pass
+            logger.debug("Anchor/heading match check failed", exc_info=True)
 
         return False
 
@@ -1147,7 +1408,7 @@ class TOCAnalyzer:
 
 
 def analyze_toc_for_sections(html_content: str, agent: Optional[str] = None,
-                             tree=None) -> Dict[str, str]:
+                             tree=None, form: Optional[str] = None) -> Dict[str, str]:
     """
     Convenience function to analyze TOC and return section mapping.
 
@@ -1155,11 +1416,15 @@ def analyze_toc_for_sections(html_content: str, agent: Optional[str] = None,
         html_content: Raw HTML content
         agent: Filing agent name or None
         tree: Pre-parsed lxml tree (optional)
+        form: SEC form type ('10-K', '10-Q', '20-F', ...) used to bound
+              TOC heuristics. Without it, the analyzer falls back to
+              a conservative default that may mis-interpret page-number
+              cells as item identifiers on forms with few items.
 
     Returns:
         Dict mapping section names to anchor IDs
     """
-    analyzer = TOCAnalyzer()
+    analyzer = TOCAnalyzer(form=form)
     return analyzer.analyze_toc_structure(html_content, agent=agent, tree=tree)
 
 
@@ -1275,6 +1540,6 @@ def _find_toc_table_start(html_content: str) -> int:
                         return pos
 
     except Exception:
-        pass
+        logger.debug("TOC table-start scan failed", exc_info=True)
 
     return -1
