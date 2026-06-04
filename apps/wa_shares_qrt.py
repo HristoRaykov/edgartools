@@ -7,7 +7,7 @@ from edgar.ttm import TTMCalculator, DurationBucket
 
 set_identity('hristocr@gmail.com')
 
-company = Company('FSK')
+company = Company('AGNC')
 
 facts = company.get_facts()
 facts_df = pd.DataFrame([asdict(f) for f in facts])
@@ -16,6 +16,9 @@ shares_facts = facts.query().by_concept(f'us-gaap:WeightedAverageNumberOfSharesO
 shares_facts_df = pd.DataFrame([asdict(f) for f in shares_facts])
 
 shares_calculator = TTMCalculator(shares_facts)
+# shr_qrtr = shares_calculator.quarterize()
+# shr_qrtr_df = pd.DataFrame([asdict(f) for f in shr_qrtr])
+
 fy_shares_list = shares_calculator._filter_by_duration(DurationBucket.ANNUAL)
 ytd9_shares_list = shares_calculator._filter_by_duration(DurationBucket.YTD_9M)
 q_shares_list = shares_calculator._filter_by_duration(DurationBucket.QUARTER)
